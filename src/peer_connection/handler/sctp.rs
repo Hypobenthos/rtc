@@ -597,7 +597,17 @@ impl<'a>
                                 ::datachannel::data_channel::DataChannel::get_reliability_params(
                                     data_channel_open.channel_type,
                                 );
-                            let mut stream = conn.open_stream(message.stream_id, message.ppi)?;
+                            // A negotiated channel's peer may send before this open runs; its
+                            // DATA then created the stream as a remote one. Take that stream so
+                            // it still gets this channel's reliability parameters.
+                            let mut stream =
+                                if message.negotiated && conn.stream(message.stream_id).is_ok() {
+                                    let mut stream = conn.stream(message.stream_id)?;
+                                    stream.set_default_payload_type(message.ppi)?;
+                                    stream
+                                } else {
+                                    conn.open_stream(message.stream_id, message.ppi)?
+                                };
                             stream.set_reliability_params(
                                 unordered,
                                 reliability_type,
@@ -1675,6 +1685,111 @@ mod tests {
             flushed.contains(&CT_SHUTDOWN),
             "the final SHUTDOWN must be flushed before removal, not dropped \
              (flushed chunk types: {flushed:?})"
+        );
+    }
+
+    /// Flags of every DATA chunk for `stream_id` in one SCTP packet (RFC 9260 §3.3.1): after
+    /// the 12-byte common header, each chunk is type, flags, length, then for DATA the TSN and
+    /// the stream identifier.
+    fn data_chunk_flags(raw: &[u8], stream_id: u16) -> Vec<u8> {
+        let mut flags = vec![];
+        let mut at = 12;
+        while at + 4 <= raw.len() {
+            let len = u16::from_be_bytes([raw[at + 2], raw[at + 3]]) as usize;
+            if len < 4 {
+                break;
+            }
+            if raw[at] == CT_PAYLOAD_DATA
+                && at + 10 <= raw.len()
+                && u16::from_be_bytes([raw[at + 8], raw[at + 9]]) == stream_id
+            {
+                flags.push(raw[at + 1]);
+            }
+            at += (len + 3) & !3;
+        }
+        flags
+    }
+
+    /// A negotiated channel's peer may send first: its DATA creates the stream as a remote one
+    /// before the local negotiated open runs. That open must still give the stream the
+    /// channel's reliability parameters instead of failing with `ErrStreamAlreadyExist`, or an
+    /// unordered, zero-retransmit channel silently sends ordered and reliable.
+    #[test]
+    fn negotiated_open_after_peer_data_applies_reliability_params() {
+        let now = Instant::now();
+        let e = establish();
+        let mut client_ep = e.client_ep;
+        let mut client_conn = e.client_conn;
+        let mut server_conn = e.server_conn;
+        server_conn
+            .open_stream(1, PayloadProtocolIdentifier::Binary)
+            .and_then(|mut s| {
+                s.write_chunk_with_ppi(
+                    now,
+                    &Bytes::from_static(b"early"),
+                    PayloadProtocolIdentifier::Binary,
+                )
+            })
+            .expect("peer DATA");
+        for dgram in drain_transmits(&mut server_conn, now) {
+            if let Some((_ch, DatagramEvent::AssociationEvent(event))) =
+                client_ep.handle(now, server_addr(), None, dgram)
+            {
+                client_conn.handle_event(event);
+            }
+        }
+        assert!(
+            client_conn.stream(1).is_ok(),
+            "the peer's DATA created stream 1"
+        );
+
+        let open = Message::DataChannelOpen(DataChannelOpen {
+            channel_type: ChannelType::PartialReliableRexmitUnordered,
+            priority: CHANNEL_PRIORITY_NORMAL,
+            reliability_parameter: 0,
+            label: b"negotiated".to_vec(),
+            protocol: Vec::new(),
+        })
+        .marshal()
+        .expect("DCEP OPEN");
+        let ch = e.client_ch.0;
+        let message = |ppi, payload: &[u8], negotiated| TaggedRTCMessageInternal {
+            now,
+            transport: TransportContext::default(),
+            message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(DataChannelMessage {
+                association_handle: ch,
+                stream_id: 1,
+                ppi,
+                payload: BytesMut::from(payload),
+                negotiated,
+            })),
+        };
+
+        let mut ctx = client_ctx(now, client_ep, e.client_ch, client_conn);
+        let mut sent = vec![];
+        {
+            let mut handler = SctpHandler::new(&mut ctx, 0);
+            handler
+                .handle_write(message(PayloadProtocolIdentifier::Dcep, &open, true))
+                .expect("negotiated open of a stream the peer already created");
+            handler
+                .handle_write(message(PayloadProtocolIdentifier::Binary, b"reply", false))
+                .expect("send on the channel");
+            while let Some(msg) = handler.poll_write() {
+                sent.push(msg);
+            }
+        }
+        let flags: Vec<u8> = sent
+            .iter()
+            .flat_map(|m| match &m.message {
+                RTCMessageInternal::Dtls(DTLSMessage::Raw(raw)) => data_chunk_flags(raw, 1),
+                _ => vec![],
+            })
+            .collect();
+        assert!(!flags.is_empty(), "the reply is sent as DATA on stream 1");
+        assert!(
+            flags.iter().all(|f| f & 0x04 != 0),
+            "DATA on the unordered channel must carry the U bit: {flags:?}"
         );
     }
 
