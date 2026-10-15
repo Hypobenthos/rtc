@@ -185,10 +185,22 @@ impl<'a>
                     return Ok(());
                 }
 
+                // A negotiated channel is dialed on `SCTPHandshakeComplete`, but the pipeline
+                // hands this handler a datagram's reads before that event, so the peer's first
+                // message can arrive first. SCTP has already acknowledged it, and inbound data
+                // means the association is up: dial now rather than drop it.
+                let mut opened = false;
+                if data_channel_internal.negotiated
+                    && data_channel_internal.data_channel.is_none()
+                    && data_channel_internal.ready_state == RTCDataChannelState::Connecting
+                {
+                    data_channel_internal.dial(message.association_handle)?;
+                    opened = true;
+                }
+
                 // Process the inbound message, then check whether a still-connecting
                 // in-band channel just completed its DCEP handshake (initiator side).
                 // If so, promote it to Open and emit the open event.
-                let mut opened = false;
                 let data_channel = data_channel_internal
                     .data_channel
                     .as_mut()
@@ -824,6 +836,64 @@ mod tests {
             stats.peer_connection.data_channels_opened, 1,
             "open stats recorded for the negotiated channel"
         );
+    }
+
+    /// The pipeline hands a datagram's reads to this handler before the events the same
+    /// datagram raised, so a negotiated channel's peer can be heard before
+    /// `SCTPHandshakeComplete` arrives. SCTP has already acknowledged that message: it must be
+    /// delivered, after exactly one open, and the later handshake event must not dial again.
+    #[test]
+    fn negotiated_channel_delivers_data_read_before_handshake_complete() {
+        let now = Instant::now();
+        let mut ctx = DataChannelHandlerContext::new(now);
+        let (mut data_channels, handles) = registry(vec![negotiated_channel(1)]);
+        let handle = handles[0];
+        let mut stats = RTCStatsAccumulator::new();
+
+        {
+            let mut handler = DataChannelHandler::new(
+                &mut ctx,
+                &mut data_channels,
+                &mut stats,
+                None,
+                RTCDtlsRole::Server,
+                None,
+            );
+            handler
+                .handle_read(TaggedRTCMessageInternal {
+                    now,
+                    transport: TransportContext::default(),
+                    message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(data_message(
+                        0, 1, b"first",
+                    ))),
+                })
+                .expect("data on a not-yet-dialed negotiated channel must not be dropped");
+            handler
+                .handle_event(TaggedRTCEventInternal {
+                    now,
+                    event: RTCEventInternal::SCTPHandshakeComplete(0),
+                })
+                .unwrap();
+        }
+
+        let events = message_events(&ctx);
+        assert_eq!(events.len(), 2, "one open and one message: {events:?}");
+        assert!(matches!(events[0], DataChannelEvent::Open));
+        assert!(
+            matches!(&events[1], DataChannelEvent::Message(m) if &m.data[..] == b"first"),
+            "the early message is delivered after the open: {events:?}"
+        );
+        assert_eq!(
+            data_channels.get(&handle).unwrap().ready_state,
+            RTCDataChannelState::Open
+        );
+        assert_eq!(stats.peer_connection.data_channels_opened, 1);
+        let opens = ctx
+            .write_outs
+            .iter()
+            .filter(|m| matches!(&m.message, RTCMessageInternal::Dtls(DTLSMessage::Sctp(o)) if o.negotiated))
+            .count();
+        assert_eq!(opens, 1, "the channel's stream is opened exactly once");
     }
 
     /// `emit_data_channel_opened` returns an error when the channel does not exist.
