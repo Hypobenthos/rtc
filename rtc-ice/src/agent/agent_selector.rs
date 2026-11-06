@@ -1,4 +1,5 @@
 use crate::agent::Agent;
+use crate::agent::agent_config::TIED_PAIR_WINDOW;
 use log::{debug, error, trace, warn};
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -78,6 +79,49 @@ impl Agent {
             }
         };
         now.saturating_duration_since(self.start_time) > min_wait
+    }
+
+    /// The pair the controlling agent should nominate now, if any: among the succeeded pairs with
+    /// the highest priority, the nominatable one with the lowest measured RTT.
+    ///
+    /// Pairs tie on priority whenever their candidates are of one type, because every UDP host
+    /// candidate carries the same local preference: wired and Wi-Fi on one subnet yield two pairs
+    /// that only the RTT of their checks tells apart. While a tied pair is still being checked,
+    /// nomination waits for it until `nomination_deadline` ([`TIED_PAIR_WINDOW`] after the first
+    /// pair succeeded).
+    fn pair_to_nominate(&self, now: Instant) -> Option<usize> {
+        let top = self
+            .candidate_pairs
+            .iter()
+            .filter(|p| p.state == CandidatePairState::Succeeded)
+            .map(CandidatePair::priority)
+            .max()?;
+        let tied = || {
+            self.candidate_pairs
+                .iter()
+                .enumerate()
+                .filter(move |(_, p)| p.priority() == top)
+        };
+        if self
+            .nomination_deadline
+            .is_some_and(|deadline| now < deadline)
+            && tied().any(|(_, p)| {
+                matches!(
+                    p.state,
+                    CandidatePairState::Waiting | CandidatePairState::InProgress
+                )
+            })
+        {
+            return None;
+        }
+        tied()
+            .filter(|(_, p)| {
+                p.state == CandidatePairState::Succeeded
+                    && self.is_nominatable(now, p.local_index, true)
+                    && self.is_nominatable(now, p.remote_index, false)
+            })
+            .min_by_key(|(_, p)| p.current_round_trip_time)
+            .map(|(index, _)| index)
     }
 
     fn nominate_pair(&mut self, now: Instant) {
@@ -210,6 +254,7 @@ impl Agent {
 impl ControllingSelector for Agent {
     fn start(&mut self, now: Instant) {
         self.nominated_pair = None;
+        self.nomination_deadline = None;
         self.start_time = now;
     }
 
@@ -228,32 +273,17 @@ impl ControllingSelector for Agent {
             }
         } else if nominated_pair_is_some {
             self.nominate_pair(now);
+        } else if let Some(pair_index) = self.pair_to_nominate(now) {
+            let p = &mut self.candidate_pairs[pair_index];
+            trace!(
+                "Nominatable pair found, nominating ({}, {})",
+                self.local_candidates[p.local_index], self.remote_candidates[p.remote_index],
+            );
+            p.nominated = true;
+            self.nominated_pair = Some(pair_index);
+            self.nominate_pair(now);
         } else {
-            let has_nominated_pair = if let Some(pair_index) = self.get_best_valid_candidate_pair()
-            {
-                let p = self.candidate_pairs[pair_index];
-                self.is_nominatable(now, p.local_index, true)
-                    && self.is_nominatable(now, p.remote_index, false)
-            } else {
-                false
-            };
-
-            if has_nominated_pair {
-                if let Some(pair_index) = self.get_best_valid_candidate_pair() {
-                    let p = &mut self.candidate_pairs[pair_index];
-                    trace!(
-                        "Nominatable pair found, nominating ({}, {})",
-                        self.local_candidates[p.local_index],
-                        self.remote_candidates[p.remote_index],
-                    );
-                    p.nominated = true;
-                    self.nominated_pair = Some(pair_index);
-                }
-
-                self.nominate_pair(now);
-            } else {
-                self.ping_all_candidates(now);
-            }
+            self.ping_all_candidates(now);
         }
     }
 
@@ -318,6 +348,8 @@ impl ControllingSelector for Agent {
             let selected_pair_is_none = self.get_selected_pair().is_none();
 
             if let Some(pair_index) = self.find_pair(local_index, remote_index) {
+                self.nomination_deadline
+                    .get_or_insert(now + TIED_PAIR_WINDOW);
                 let p = &mut self.candidate_pairs[pair_index];
                 p.state = CandidatePairState::Succeeded;
 
@@ -383,15 +415,15 @@ impl ControllingSelector for Agent {
                         "controllingSelector: getBestAvailableCandidatePair {}",
                         best_pair_index
                     );
-                    if best_pair_index == pair_index
-                        && self.is_nominatable(now, p.local_index, true)
-                        && self.is_nominatable(now, p.remote_index, false)
+                    // No pair outranks this one; nominate the best of those tied with it.
+                    if self.candidate_pairs[best_pair_index].priority() == p.priority()
+                        && let Some(nominee) = self.pair_to_nominate(now)
                     {
                         trace!(
-                            "The candidate ({}, {}) is the best candidate available, marking it as nominated",
-                            p.local_index, p.remote_index
+                            "The candidate pair {} is the best candidate available, marking it as nominated",
+                            nominee
                         );
-                        self.nominated_pair = Some(pair_index);
+                        self.nominated_pair = Some(nominee);
                         self.nominate_pair(now);
                     }
                 } else {

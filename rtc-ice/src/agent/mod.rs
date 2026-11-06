@@ -150,6 +150,9 @@ pub struct Agent {
     pub(crate) remote_candidates: Vec<Candidate>,
     pub(crate) candidate_pairs: Vec<CandidatePair>,
     pub(crate) nominated_pair: Option<usize>,
+    // Controlling only: until when nomination waits for pairs tied with the best valid pair to
+    // finish their checks. Set when the first pair succeeds, cleared by `start`.
+    pub(crate) nomination_deadline: Option<Instant>,
     pub(crate) selected_pair: Option<usize>,
 
     // LRU of outbound Binding request Transaction IDs
@@ -267,6 +270,7 @@ impl Agent {
             start_time: now,
 
             nominated_pair: None,
+            nomination_deadline: None,
             selected_pair: None,
             candidate_pairs: vec![],
 
@@ -1604,24 +1608,20 @@ impl Agent {
         best_pair_index
     }
 
-    pub(crate) fn get_best_valid_candidate_pair(&self) -> Option<usize> {
-        let mut best_pair_index: Option<usize> = None;
-
-        for (index, p) in self.candidate_pairs.iter().enumerate() {
-            if p.state != CandidatePairState::Succeeded {
-                continue;
+    /// When `handle_timeout` should next run `contact`: at the next check, or earlier while the
+    /// controlling agent holds its nomination open for tied pairs, when that window closes.
+    pub(crate) fn next_contact_time(&self) -> Instant {
+        let check = self.last_checking_time + self.get_timeout_interval();
+        match self.nomination_deadline {
+            Some(deadline)
+                if self.is_controlling
+                    && self.nominated_pair.is_none()
+                    && self.selected_pair.is_none()
+                    && deadline > self.last_checking_time =>
+            {
+                deadline.min(check)
             }
-
-            if let Some(pair_index) = &mut best_pair_index {
-                let b = &self.candidate_pairs[*pair_index];
-                if b.priority() < p.priority() {
-                    *pair_index = index;
-                }
-            } else {
-                best_pair_index = Some(index);
-            }
+            _ => check,
         }
-
-        best_pair_index
     }
 }

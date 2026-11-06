@@ -124,8 +124,7 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         self.trigger_request_connectivity_check(remote_candidates);
 
         if self.ufrag_pwd.remote_credentials.is_some()
-            && (self.force_candidate_contact
-                || self.last_checking_time + self.get_timeout_interval() <= now)
+            && (self.force_candidate_contact || self.next_contact_time() <= now)
         {
             self.contact(now);
         }
@@ -150,7 +149,7 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
                 // past, so the resulting deadline is immediate.
                 Some(self.last_checking_time)
             } else {
-                Some(self.last_checking_time + self.get_timeout_interval())
+                Some(self.next_contact_time())
             }
         } else {
             None

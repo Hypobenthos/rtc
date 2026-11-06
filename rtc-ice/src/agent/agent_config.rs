@@ -30,6 +30,16 @@ pub(crate) const DEFAULT_PRFLX_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_mi
 /// Wait time before nominating a relay candidate.
 pub(crate) const DEFAULT_RELAY_ACCEPTANCE_MIN_WAIT: Duration = Duration::from_millis(2000);
 
+/// How long, after its first pair succeeds, the controlling agent waits for pairs that tie with the
+/// best valid pair on priority to finish their checks before nominating, so that the lowest RTT
+/// among them wins (see `Agent::pair_to_nominate`).
+///
+/// Every pending pair is checked in the same round, so a live pair that ties with the first valid
+/// one answers within a few milliseconds of it on a LAN, and one that answers later was slower
+/// anyway. The window only runs to its end when a tied pair never answers (a VPN or tun interface's
+/// host candidate, for one), so it is kept short: it is added to connection setup then.
+pub(crate) const TIED_PAIR_WINDOW: Duration = Duration::from_millis(50);
+
 /// Max binding request before considering a pair failed.
 pub(crate) const DEFAULT_MAX_BINDING_REQUESTS: u16 = 7;
 

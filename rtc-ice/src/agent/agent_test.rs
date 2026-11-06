@@ -3386,3 +3386,153 @@ fn test_stats_snapshot_reports_the_callers_instant_throughout() -> Result<()> {
 
     Ok(())
 }
+
+fn udp_host(address: &str, port: u16) -> Result<Candidate> {
+    CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: address.to_owned(),
+            port,
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()
+}
+
+/// A controlling agent with host candidates on `locals` and one remote host candidate, whose first
+/// round of checks went out at `sent`. Pair `i` is `locals[i]` with the remote; returns the
+/// transaction of each pair's check, in pair order.
+fn checking_agent(
+    start: Instant,
+    sent: Instant,
+    locals: &[&str],
+) -> Result<(Agent, Vec<TransactionId>)> {
+    let mut a = Agent::new(
+        start,
+        Arc::new(AgentConfig {
+            is_controlling: true,
+            ..Default::default()
+        }),
+        test_crypto_provider(),
+    )?;
+    for local in locals {
+        a.add_local_candidate(udp_host(local, 5000)?)?;
+    }
+    a.add_remote_candidate(udp_host("192.168.124.9", 6000)?)?;
+    a.start_connectivity_checks(
+        start,
+        true,
+        "remoteufrag".into(),
+        "remotepwd0123456789abcdef".into(),
+    )?;
+    a.handle_timeout(sent)?;
+    assert_eq!(
+        a.pending_binding_requests.len(),
+        locals.len(),
+        "one check per pair"
+    );
+    let checks = a
+        .pending_binding_requests
+        .iter()
+        .map(|r| r.transaction_id)
+        .collect();
+    Ok((a, checks))
+}
+
+/// The remote answers check `tid` on pair `pair` at `at`.
+fn answer_check(a: &mut Agent, pair: usize, tid: TransactionId, at: Instant) -> Result<()> {
+    let mut m = Message::new();
+    m.build(&[Box::new(BINDING_SUCCESS), Box::new(tid)])?;
+    let (local, remote) = (
+        a.candidate_pairs[pair].local_index,
+        a.candidate_pairs[pair].remote_index,
+    );
+    let remote_addr = a.remote_candidates[remote].addr();
+    a.handle_success_response(at, &m, local, remote, remote_addr);
+    assert_eq!(a.candidate_pairs[pair].state, CandidatePairState::Succeeded);
+    Ok(())
+}
+
+// Wired (.34) and Wi-Fi (.15) on one subnet, plus a tun interface (198.18.0.1) whose check never
+// comes back: three host pairs tied on priority. The Wi-Fi pair answers first, but the wired pair's
+// check (re-sent later) comes back with the lower RTT inside the tie window. The agent wakes itself
+// when the window closes, without waiting for the next 200 ms check, and nominates the wired pair.
+#[test]
+fn test_tied_pairs_nominate_lowest_rtt_when_window_closes() -> Result<()> {
+    let start = Instant::now();
+    let t = |ms: u64| start + Duration::from_millis(ms);
+    let (mut a, checks) = checking_agent(
+        start,
+        t(1),
+        &["192.168.124.34", "192.168.124.15", "198.18.0.1"],
+    )?;
+    let p0 = a.candidate_pairs[0].priority();
+    assert!(
+        a.candidate_pairs.iter().all(|p| p.priority() == p0),
+        "host pairs tie"
+    );
+
+    answer_check(&mut a, 1, checks[1], t(10))?; // Wi-Fi: 9 ms
+    a.handle_timeout(t(10))?;
+    assert!(
+        a.nominated_pair.is_none(),
+        "tied pairs are still being checked"
+    );
+    let deadline = t(10) + TIED_PAIR_WINDOW;
+    assert_eq!(a.next_contact_time(), deadline);
+
+    a.pending_binding_requests
+        .iter_mut()
+        .find(|r| r.transaction_id == checks[0])
+        .unwrap()
+        .timestamp = t(8);
+    answer_check(&mut a, 0, checks[0], t(11))?; // wired: 3 ms
+    a.handle_timeout(deadline - Duration::from_millis(1))?;
+    assert!(
+        a.nominated_pair.is_none(),
+        "the tun pair keeps the window open"
+    );
+
+    a.handle_timeout(deadline)?;
+    assert_eq!(a.nominated_pair, Some(0), "lowest RTT among the tied pairs");
+    assert!(a.candidate_pairs[0].nominated);
+    assert_eq!(
+        a.next_contact_time(),
+        deadline + DEFAULT_CHECK_INTERVAL,
+        "back to the regular checks"
+    );
+
+    a.close()?;
+    Ok(())
+}
+
+// Once every tied pair has finished its check, the remote's check on any of them nominates the one
+// with the lowest RTT at once, not the pair the remote's check arrived on.
+#[test]
+fn test_remote_check_nominates_lowest_rtt_once_tied_checks_finish() -> Result<()> {
+    let start = Instant::now();
+    let t = |ms: u64| start + Duration::from_millis(ms);
+    let (mut a, checks) = checking_agent(start, t(1), &["192.168.124.34", "192.168.124.15"])?;
+    let remote_check = || -> Result<Message> {
+        let mut m = Message::new();
+        m.build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])?;
+        Ok(m)
+    };
+
+    answer_check(&mut a, 1, checks[1], t(10))?; // Wi-Fi: 9 ms
+    a.handle_binding_request(t(10), &remote_check()?, 1, 0);
+    assert!(
+        a.nominated_pair.is_none(),
+        "the wired pair is still being checked"
+    );
+
+    a.pending_binding_requests[0].timestamp = t(8);
+    answer_check(&mut a, 0, checks[0], t(11))?; // wired: 3 ms
+    a.handle_binding_request(t(12), &remote_check()?, 1, 0);
+    assert_eq!(a.nominated_pair, Some(0));
+
+    a.close()?;
+    Ok(())
+}
